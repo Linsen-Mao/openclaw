@@ -1,8 +1,7 @@
-# Execution Service Factsheet (v3)
+# Execution Service Factsheet
 
 **Status**: Product Architecture
 **Last Updated**: 2026-02-04
-**Changes from v2**: Added frontend, project board UI, sleep-time compute, trace-based self-improvement, async/sync hybrid collaboration model, dual interaction modes (quick/task), chat-based task creation, question supersession, external world watchers, policy engine (attention/WIP/autonomy/planning policies), weekly review ritual, success criteria with self-assessment, priority classification, behavior calibration.
 
 ---
 
@@ -2550,31 +2549,967 @@ CREATE TABLE behavior_feedback (
 
 ---
 
-## 16. Unchanged from v2
+## 16. Core Agent Architecture
 
-The following sections from v2 are unchanged and still apply:
+The following subsections define the foundational agent infrastructure. These are the low-level building blocks that the higher-level features (board, collaboration, policy engine, watchers) build upon.
 
-| v2 Section | Topic |
-|------------|-------|
-| 4. Agent Loop | Core loop pseudocode, injection queue, initial context (with additions in Section 14 above) |
-| 5. Planning Tool | update_plan definition and execution (now also triggers board sync) |
-| 6. Compaction Engine | Full compaction flow, memory flush, summarization |
-| 7. File System Context | Workspace layout, memo tools, tiered memory |
-| 9. Sub-Agent Management | spawn_agent, sub-agent manager, result passing |
-| 10. Skills System | SKILL.md, list_skills, read_skill |
-| 11. Risk Control | Classification, rules, doom loop detection |
-| 12. Docker Container Management | Container lifecycle, configuration, per-task isolation |
-| 17. Configuration | Environment variables, per-task overrides |
-| 18. Error Handling | Error categories, LLM retry, container errors |
-| Appendix A | System prompt template (extend with collaboration instructions) |
+### 16.1 Agent Loop (Core)
+
+#### 16.1.1 The Loop
+
+This is the heart of the service. The LLM runs in a loop, calling tools and receiving results until it produces a final response or hits a termination condition.
+
+```typescript
+interface AgentLoopConfig {
+  task_id: string;
+  goal: string;
+  context: TaskContext;           // from Context Service
+  container: DockerContainer;
+  tools: Tool[];
+  risk_policy: RiskPolicy;
+  model: string;
+  max_iterations: number;        // default: 200
+  timeout_ms: number;            // default: 600_000 (10 min)
+  compaction_config: CompactionConfig;
+}
+
+interface AgentLoopResult {
+  task_id: string;
+  status: 'COMPLETED' | 'FAILED' | 'BLOCKED_USER' | 'PAUSED' | 'CANCELLED';
+  deliverables: Deliverable[];
+  evidence_refs: EvidenceRef[];
+  final_message?: string;
+  working_memory: WorkingMemory;
+  usage: UsageMetrics;
+  error_details?: ErrorDetails;
+}
+```
+
+#### 16.1.2 Loop Pseudocode
+
+```typescript
+async function runAgentLoop(config: AgentLoopConfig): Promise<AgentLoopResult> {
+  const messages: Message[] = buildInitialContext(config);
+  let iteration = 0;
+
+  while (iteration < config.max_iterations) {
+    // Check external signals
+    if (isCancelled(config.task_id)) return { status: 'CANCELLED', ... };
+    if (isPaused(config.task_id))    return { status: 'PAUSED', ... };
+    if (isTimedOut(config))          return { status: 'FAILED', error: 'timeout', ... };
+
+    // Think: call LLM
+    const response = await llm.call({
+      model: config.model,
+      messages,
+      tools: formatToolsForLLM(config.tools),
+    });
+
+    // No tool calls = agent is done
+    if (!response.tool_calls || response.tool_calls.length === 0) {
+      messages.push({ role: 'assistant', content: response.content });
+      return packageResult(config, messages, 'COMPLETED');
+    }
+
+    // Act: execute tool calls
+    messages.push({ role: 'assistant', content: response.content, tool_calls: response.tool_calls });
+
+    for (const toolCall of response.tool_calls) {
+      // Risk check
+      const risk = classifyRisk(toolCall, config.risk_policy);
+      if (risk === 'CRITICAL') {
+        messages.push(toolResult(toolCall.id, 'DENIED: This action is not permitted.'));
+        continue;
+      }
+      if (risk === 'HIGH') {
+        // Trigger HITL via post_comment(block=true)
+        return { status: 'BLOCKED_USER', pendingAction: toolCall, ... };
+      }
+
+      // Execute (with side effects pipeline — see Section 14)
+      const result = await executeToolWithSideEffects(toolCall, config.container, config.task_id);
+      messages.push(toolResult(toolCall.id, result));
+    }
+
+    // Check injected messages (user comments, HITL responses, external events, watcher triggers)
+    const injections = await drainInjections(config.task_id);
+    for (const injection of injections) {
+      messages.push({ role: 'user', content: formatInjection(injection) });
+    }
+
+    // Compaction check
+    if (shouldCompact(messages, config.compaction_config)) {
+      messages = await compactWithMemoryFlush(messages, config);
+    }
+
+    iteration++;
+  }
+
+  return packageResult(config, messages, 'FAILED', 'max_iterations_exceeded');
+}
+```
+
+#### 16.1.3 Initial Context Construction
+
+```typescript
+function buildInitialContext(config: AgentLoopConfig): Message[] {
+  return [
+    {
+      role: 'system',
+      content: buildSystemPrompt(config),
+    },
+    {
+      role: 'user',
+      content: buildTaskMessage(config),
+    },
+  ];
+}
+```
+
+The system prompt includes:
+1. **Identity and role** (~20 lines)
+2. **Available tools** (auto-generated from tool registry)
+3. **Planning instructions** — how to use update_plan tool
+4. **File system instructions** — workspace layout, when to write notes
+5. **Compaction awareness** — "I may summarize older messages; important info should be saved to .memo/"
+6. **Safety and risk rules** (~30 lines)
+7. **Output format** — how to structure deliverables
+8. **Skills** — discovered skills loaded into prompt or referenced via tools
+9. **Collaboration** — how to use post_comment, request_discussion, publish_deliverable
+10. **Planning heuristics** — risk-first ordering, success criteria, manage-up behavior
+
+The task message includes:
+1. **Goal** (from user / chat)
+2. **Constraints** (if any)
+3. **Relevant memories** (from Context Service)
+4. **Success criteria** (generated during planning, confirmed by user)
+5. **Previous attempt context** (if resuming)
+
+#### 16.1.4 Injection Queue
+
+External inputs are queued and drained each iteration:
+
+```typescript
+interface InjectionQueue {
+  /** Push an injection for the agent to see on its next iteration */
+  push(taskId: string, injection: AgentInjection): Promise<void>;
+
+  /** Drain all pending injections (called each iteration) */
+  drain(taskId: string): Promise<AgentInjection[]>;
+}
+```
+
+Implementation: Redis list per task_id. API server pushes, agent loop drains.
+
+### 16.2 Planning Tool (Context Engineering)
+
+#### 16.2.1 Purpose
+
+The planning tool is a **context engineering strategy** to keep the agent on track during long-running tasks. It is inspired by Claude Code's todo list tool — "basically a no-op — it is just a context engineering strategy."
+
+The tool writes the plan to a workspace file AND returns it as the tool result, ensuring the plan is always visible in the agent's context window.
+
+#### 16.2.2 Tool Definition
+
+```typescript
+const updatePlanTool: Tool = {
+  name: 'update_plan',
+  description: `Update your current execution plan. Call this tool:
+- At the start of a task to create your initial plan
+- After completing a step to mark progress
+- When you discover new information that changes the approach
+- Before spawning sub-agents to clarify task division
+
+The plan helps you stay on track over long execution horizons.`,
+  parameters: {
+    type: 'object',
+    properties: {
+      steps: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            description: { type: 'string' },
+            status: { type: 'string', enum: ['pending', 'in_progress', 'done', 'blocked', 'skipped'] },
+            notes: { type: 'string', description: 'Optional notes, findings, or blockers' },
+          },
+          required: ['id', 'description', 'status'],
+        },
+      },
+      current_focus: {
+        type: 'string',
+        description: 'What you are working on right now',
+      },
+      overall_approach: {
+        type: 'string',
+        description: 'High-level approach summary',
+      },
+    },
+    required: ['steps'],
+  },
+};
+```
+
+#### 16.2.3 Tool Execution
+
+```typescript
+async function executeUpdatePlan(params: PlanParams, container: Container): Promise<string> {
+  // Write to workspace file (persists across compaction)
+  const planContent = formatPlanAsMarkdown(params);
+  await container.writeFile('/workspace/.plan.md', planContent);
+
+  // Return the plan as tool result (keeps it in context)
+  return `Plan updated (${params.steps.filter(s => s.status === 'done').length}/${params.steps.length} done).\n\n${planContent}`;
+}
+
+function formatPlanAsMarkdown(params: PlanParams): string {
+  let md = `# Execution Plan\n\n`;
+  if (params.overall_approach) md += `**Approach**: ${params.overall_approach}\n\n`;
+  if (params.current_focus) md += `**Current focus**: ${params.current_focus}\n\n`;
+  md += `## Steps\n\n`;
+  for (const step of params.steps) {
+    const icon = { pending: '[ ]', in_progress: '[>]', done: '[x]', blocked: '[!]', skipped: '[-]' }[step.status];
+    md += `- ${icon} **${step.id}**: ${step.description}`;
+    if (step.notes) md += ` — _${step.notes}_`;
+    md += `\n`;
+  }
+  return md;
+}
+```
+
+**Side effect**: After execution, the Board Sync Engine projects plan steps onto the project board as work items (see Section 3.4).
+
+### 16.3 Compaction Engine
+
+#### 16.3.1 Purpose
+
+Long-running agents accumulate context that exceeds the model's context window. The compaction engine manages this by:
+1. Giving the agent a chance to save important information (memory flush)
+2. Summarizing older conversation turns
+3. Preserving recent turns intact
+
+#### 16.3.2 Configuration
+
+```typescript
+interface CompactionConfig {
+  /** Context window size of the model (tokens) */
+  context_window_tokens: number;
+
+  /** Reserved tokens for the model's response */
+  response_reserve_tokens: number;        // default: 4096
+
+  /** Trigger compaction when usage exceeds this ratio */
+  compaction_trigger_ratio: number;        // default: 0.85
+
+  /** Enable pre-compaction memory flush */
+  memory_flush_enabled: boolean;           // default: true
+
+  /** Soft threshold: trigger flush this many tokens before compaction */
+  memory_flush_soft_threshold_tokens: number;  // default: 4000
+
+  /** Maximum summary length (tokens) */
+  max_summary_tokens: number;              // default: 2000
+
+  /** Number of recent turns to always preserve */
+  preserve_recent_turns: number;           // default: 6
+}
+```
+
+#### 16.3.3 Compaction Flow
+
+```
+Token usage approaching limit?
+        |
+        v YES
++----------------------------------------------+
+| PHASE 1: Memory Flush                        |
+|                                               |
+| Inject a system message:                      |
+| "You are approaching context limits.          |
+|  Save any important information to            |
+|  /workspace/.memo/ before I summarize         |
+|  older messages. Use save_memo tool."          |
+|                                               |
+| Run 1-3 agent iterations for the flush.       |
+| Agent writes durable notes to .memo/ files.   |
++----------------------+------------------------+
+                       |
+                       v
++----------------------------------------------+
+| PHASE 2: Summarization                        |
+|                                               |
+| 1. Split messages into:                       |
+|    - Old turns (to summarize)                 |
+|    - Recent turns (to preserve)               |
+|                                               |
+| 2. Chunk old turns by token budget            |
+|    (adaptive chunk ratio based on avg size)   |
+|                                               |
+| 3. For each chunk, generate summary via LLM:  |
+|    - Preserve tool failures and key findings  |
+|    - Include file paths modified               |
+|    - Note decisions made and reasons           |
+|                                               |
+| 4. Replace old turns with summary message     |
++----------------------+------------------------+
+                       |
+                       v
++----------------------------------------------+
+| PHASE 3: Reassembly                           |
+|                                               |
+| New context:                                  |
+| [system prompt]                               |
+| [summary of older turns]                      |
+| [preserved recent turns]                      |
+|                                               |
+| Agent continues from here.                    |
+| Can recover details via:                      |
+| - search_memo (semantic search over .memo/)   |
+| - read file from workspace                    |
++----------------------------------------------+
+```
+
+#### 16.3.4 Compaction Trigger Logic
+
+```typescript
+function shouldCompact(messages: Message[], config: CompactionConfig): boolean {
+  const usedTokens = estimateTokens(messages);
+  const availableTokens = config.context_window_tokens - config.response_reserve_tokens;
+  return usedTokens / availableTokens > config.compaction_trigger_ratio;
+}
+
+function shouldFlushMemory(messages: Message[], config: CompactionConfig): boolean {
+  if (!config.memory_flush_enabled) return false;
+  const usedTokens = estimateTokens(messages);
+  const threshold = config.context_window_tokens - config.response_reserve_tokens - config.memory_flush_soft_threshold_tokens;
+  return usedTokens > threshold;
+}
+```
+
+#### 16.3.5 Summarization Strategy
+
+```typescript
+async function summarizeMessages(
+  messages: Message[],
+  config: CompactionConfig,
+): Promise<string> {
+  const avgTokensPerMessage = estimateTokens(messages) / messages.length;
+  const chunkRatio = computeAdaptiveChunkRatio(avgTokensPerMessage);
+  const chunkMaxTokens = Math.floor(config.max_summary_tokens * chunkRatio);
+
+  const chunks = chunkMessagesByMaxTokens(messages, chunkMaxTokens);
+  const summaries: string[] = [];
+
+  for (const chunk of chunks) {
+    const summary = await llm.call({
+      model: config.summarization_model || 'fast-model',
+      messages: [
+        { role: 'system', content: SUMMARIZATION_PROMPT },
+        { role: 'user', content: formatMessagesForSummary(chunk) },
+      ],
+    });
+    summaries.push(summary.content);
+  }
+
+  return summaries.join('\n\n---\n\n');
+}
+
+const SUMMARIZATION_PROMPT = `Summarize this agent conversation segment. Preserve:
+- Tool call failures and error messages (exact error text)
+- File paths created, modified, or read
+- Key decisions made and their reasoning
+- Findings and factual information discovered
+- Current state of the task plan
+- Any user instructions or corrections received
+
+Keep the summary concise but information-dense. Use bullet points.
+Do NOT include raw file contents or full command outputs — summarize them.`;
+```
+
+### 16.4 File System Context Management
+
+#### 16.4.1 Workspace Layout
+
+Every task gets an isolated workspace mounted into the Docker container:
+
+```
+/workspace/
++-- .plan.md              # Current plan (written by update_plan tool)
++-- .memo/                # Durable notes (survive compaction, agent reads via search_memo)
+|   +-- findings.md       # Key discoveries
+|   +-- decisions.md      # Decisions and reasoning
+|   +-- ...               # Agent creates as needed
++-- .scratch/             # Temporary working files
++-- output/               # Final deliverables
+|   +-- report.md         # Example: generated report
+|   +-- screenshot.png    # Example: evidence screenshot
+|   +-- ...
++-- (task-specific files)  # Files the agent creates for the task
+```
+
+#### 16.4.2 Memo Tools
+
+```typescript
+const saveMemoTool: Tool = {
+  name: 'save_memo',
+  description: `Save a note to your durable memo storage. Use this for:
+- Important findings you might need later
+- Decisions and their reasoning
+- Key information that should survive context summarization
+Notes are saved to /workspace/.memo/ and can be searched with search_memo.`,
+  parameters: {
+    type: 'object',
+    properties: {
+      filename: { type: 'string', description: 'Name for the memo file (e.g., "api-findings.md")' },
+      content: { type: 'string', description: 'Content to save' },
+      append: { type: 'boolean', description: 'Append to existing file instead of overwriting', default: false },
+    },
+    required: ['filename', 'content'],
+  },
+};
+
+const searchMemoTool: Tool = {
+  name: 'search_memo',
+  description: `Search your memo storage for previously saved notes. Use this to recall:
+- Findings from earlier in the task
+- Decisions you made and why
+- Information that was saved before context summarization`,
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Search query (semantic search over memo contents)' },
+    },
+    required: ['query'],
+  },
+};
+```
+
+#### 16.4.3 Tiered Memory
+
+After compaction, the agent has a tiered memory system:
+- **Hot**: Current conversation context (recent turns)
+- **Warm**: Compaction summary (compressed older turns)
+- **Cold**: Workspace files (.memo/, .plan.md, task files) — recovered via search_memo or read
+
+### 16.5 Tool System
+
+#### 16.5.1 Tool Architecture
+
+```
++-------------------------------------------------------------+
+|                      TOOL SYSTEM                             |
++-------------------------------------------------------------+
+|                                                              |
+|   ToolRegistry                                               |
+|   +-- Stores all tool definitions                            |
+|   +-- Formats tools for LLM (function calling schema)        |
+|   +-- Filters by risk policy                                 |
+|                                                              |
+|   ToolRunner                                                 |
+|   +-- Validates parameters (Zod schemas)                     |
+|   +-- Classifies risk before execution                       |
+|   +-- Executes tools in container (or in-process)            |
+|   +-- Handles retry for transient errors                     |
+|   +-- Detects doom loops (repetitive failing calls)          |
+|   +-- Truncates large outputs (configurable limit)           |
+|   +-- Records tool calls for observability                   |
+|                                                              |
++-------------------------------------------------------------+
+```
+
+#### 16.5.2 Tool Output Truncation
+
+Large tool outputs are truncated to prevent context window exhaustion:
+
+```typescript
+const TOOL_OUTPUT_MAX_TOKENS = 8000;
+
+async function truncateToolOutput(output: string, toolCallId: string, container: Container): Promise<string> {
+  const tokens = estimateTokens(output);
+  if (tokens <= TOOL_OUTPUT_MAX_TOKENS) return output;
+
+  const filepath = `/workspace/.scratch/tool-output-${toolCallId}.txt`;
+  await container.writeFile(filepath, output);
+
+  const truncated = output.slice(0, approximateCharLimit(TOOL_OUTPUT_MAX_TOKENS));
+  return `${truncated}\n\n[OUTPUT TRUNCATED — full output saved to ${filepath}. Use read tool to access.]`;
+}
+```
+
+### 16.6 Sub-Agent Management
+
+#### 16.6.1 Design
+
+Sub-agents are spawned by the main agent (via `spawn_agent` tool), not scheduled externally. The agent decides when context isolation is needed.
+
+```typescript
+interface SubAgentManager {
+  /** Spawn a sub-agent, returns when complete */
+  spawn(config: SubAgentConfig): Promise<SubAgentResult>;
+
+  /** Spawn multiple sub-agents in parallel */
+  spawnParallel(configs: SubAgentConfig[]): Promise<SubAgentResult[]>;
+
+  /** Cancel a running sub-agent */
+  cancel(agentId: string): Promise<void>;
+
+  /** Cancel all running sub-agents */
+  cancelAll(): Promise<void>;
+}
+
+interface SubAgentConfig {
+  task: string;
+  label: string;
+  timeout_ms: number;
+  model?: string;
+  write_output_to?: string;
+}
+
+interface SubAgentResult {
+  label: string;
+  status: 'completed' | 'failed' | 'timeout';
+  output: string;       // Final assistant message (explicit, not "look above")
+  usage: UsageMetrics;
+  duration_ms: number;
+  error?: string;
+}
+```
+
+#### 16.6.2 spawn_agent Tool
+
+```typescript
+const spawnAgentTool: Tool = {
+  name: 'spawn_agent',
+  description: `Spawn an independent sub-agent to work on a specific task.
+Use for context isolation: the sub-agent gets a fresh context window and works independently.
+Good for:
+- Long research tasks that would fill your context
+- Parallel independent work streams
+- Tasks that need deep focus without cluttering your context
+
+The sub-agent shares your workspace filesystem.
+Results are returned as text when the sub-agent completes.`,
+  parameters: {
+    type: 'object',
+    properties: {
+      task: { type: 'string', description: 'Clear task description for the sub-agent' },
+      label: { type: 'string', description: 'Short label for tracking (e.g., "research-pricing")' },
+      timeout_seconds: { type: 'number', description: 'Timeout in seconds', default: 300 },
+      write_output_to: { type: 'string', description: 'File path in workspace to write results (optional)' },
+    },
+    required: ['task'],
+  },
+};
+```
+
+#### 16.6.3 Sub-Agent Context
+
+Each sub-agent gets:
+- **Fresh context window** (own conversation history)
+- **Minimal system prompt** (subset of parent's — tools, safety, workspace layout)
+- **Shared workspace filesystem** (can read/write files the parent created)
+- **Same tools** as the parent (except `spawn_agent` to prevent recursive spawning — configurable depth limit)
+- **No injection queue** (sub-agents don't receive external input; they run to completion)
+
+#### 16.6.4 Result Passing
+
+Sub-agent results are passed to the parent as the tool call result:
+
+```
+spawn_agent result:
+
+Sub-agent "research-pricing" completed in 45s (2,340 tokens).
+
+Result:
+[Sub-agent's final assistant message text here]
+
+Output written to: /workspace/output/pricing-research.md
+```
+
+### 16.7 Skills System
+
+Skills are **pure instruction files** (SKILL.md) pre-installed in containers.
+
+#### 16.7.1 Skill Discovery Flow
+
+```
+Agent: "I need to automate browser actions"
+     |
+     v
+list_skills -> ["browser-automation", "pdf", "xlsx", ...]
+     |
+     v
+read_skill("browser-automation") -> SKILL.md content with instructions
+     |
+     v
+Agent follows instructions using browser/bash/other tools
+```
+
+#### 16.7.2 SKILL.md Format
+
+```markdown
+---
+name: browser-automation
+description: Automate browser interactions
+---
+
+# Browser Automation Skill
+
+## Navigation
+- Use `browser navigate <url>` to open a page
+- Use `browser screenshot` to capture current state
+
+## Interaction
+[instructions with tool usage examples]
+```
+
+### 16.8 Risk Control
+
+#### 16.8.1 Risk Classification
+
+| Risk Level | Action |
+|------------|--------|
+| **LOW** | Allow |
+| **MEDIUM** | Allow with logging |
+| **HIGH** | Block, trigger HITL via `post_comment(block=true)` |
+| **CRITICAL** | Deny (return error to agent) |
+
+#### 16.8.2 Risk Rules
+
+| Pattern | Risk Level |
+|---------|------------|
+| Read-only tools (read, glob, grep, list_skills, read_skill, search_memo) | LOW |
+| Context tools (update_plan, save_memo, publish_deliverable, post_comment) | LOW |
+| File edit (edit) | LOW |
+| File creation (write) | MEDIUM |
+| Bash general commands | MEDIUM |
+| Web search/fetch | MEDIUM |
+| Browser navigation | MEDIUM |
+| Browser form submission | HIGH |
+| Bash with rm, chmod, chown | HIGH |
+| Bash with rm -rf, sudo | CRITICAL |
+
+#### 16.8.3 Doom Loop Detection
+
+```typescript
+interface DoomLoopConfig {
+  /** Max consecutive identical tool calls before intervention */
+  max_identical_calls: number;     // default: 3
+
+  /** Max consecutive failures before stopping */
+  max_consecutive_failures: number; // default: 5
+
+  /** Window size for pattern detection */
+  pattern_window: number;          // default: 10
+}
+```
+
+When a doom loop is detected:
+1. Inject a system message: "You appear to be repeating the same action. Reconsider your approach."
+2. If it continues, inject: "Stop and re-read your plan. What should you do differently?"
+3. If still looping after 3 interventions, fail the task.
+
+### 16.9 Docker Container Management
+
+#### 16.9.1 Container Lifecycle
+
+```
+Provision -> Start -> Execute (agent loop) -> Cleanup
+```
+
+#### 16.9.2 Container Configuration
+
+| Setting | Default |
+|---------|---------|
+| Image | execution-agent:latest |
+| Memory | 2GB |
+| CPU | 2 cores |
+| Network | bridge (restricted) |
+| Workspace | /workspace/ (RW, mounted volume) |
+| Skills | /skills/ (RO, mounted) |
+
+#### 16.9.3 Container Per Task
+
+Each task gets its own container. Sub-agents share the parent's container (and workspace).
+
+```typescript
+interface ContainerManager {
+  /** Provision a new container for a task */
+  provision(config: ContainerConfig): Promise<DockerContainer>;
+
+  /** Execute a command in the container */
+  exec(container: DockerContainer, command: string, timeout_ms: number): Promise<ExecResult>;
+
+  /** Read a file from the container */
+  readFile(container: DockerContainer, path: string): Promise<string>;
+
+  /** Write a file to the container */
+  writeFile(container: DockerContainer, path: string, content: string): Promise<void>;
+
+  /** Cleanup and remove container */
+  cleanup(container: DockerContainer): Promise<void>;
+}
+```
+
+### 16.10 Data Models (Input/Output)
+
+#### 16.10.1 TaskCommand (Input)
+
+```typescript
+interface TaskCommand {
+  command_id: string;
+  session_id: string;
+  task_id: string;
+  goal: string;
+  constraints?: string[];
+  execution_config: {
+    timeout_seconds: number;       // default: 600
+    max_iterations: number;        // default: 200
+    model: string;                 // default: "claude-sonnet-4-20250514"
+    compaction: CompactionConfig;
+  };
+  resume_context?: ResumeContext;  // If resuming from pause/blocked
+}
+
+interface ResumeContext {
+  previous_messages: Message[];
+  injection: AgentInjection;       // The HITL response or resume signal
+}
+```
+
+#### 16.10.2 TaskResult (Output)
+
+```typescript
+interface TaskResult {
+  task_id: string;
+  session_id: string;
+  command_id: string;
+  status: TaskResultStatus;
+  deliverables: Deliverable[];
+  final_message?: string;
+  evidence_refs: EvidenceRef[];
+  usage: UsageMetrics;
+  error_details?: ErrorDetails;
+  hitl_request?: HITLRequest;      // If status is BLOCKED_USER
+}
+
+enum TaskResultStatus {
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+  BLOCKED_USER = 'BLOCKED_USER',
+  PAUSED = 'PAUSED',
+  CANCELLED = 'CANCELLED',
+}
+
+interface UsageMetrics {
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  iterations: number;
+  tool_calls: number;
+  sub_agents_spawned: number;
+  compactions: number;
+  duration_ms: number;
+}
+
+interface EvidenceRef {
+  ref_id: string;
+  type: 'screenshot' | 'file' | 'log' | 'url';
+  uri: string;
+  description?: string;
+}
+```
+
+### 16.11 Configuration
+
+#### 16.11.1 Environment Variables
+
+```bash
+# LLM (required)
+ANTHROPIC_API_KEY=your-api-key
+OPENAI_API_KEY=your-api-key
+
+# Models
+THINKING_MODEL=claude-sonnet-4-20250514
+FAST_MODEL=claude-haiku-4-20250414
+
+# Container
+CONTAINER_MODE=docker|mock
+CONTAINER_IMAGE=execution-agent:latest
+CONTAINER_MEMORY=2g
+CONTAINER_CPU=2
+
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# Database
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/execution_service
+
+# Agent defaults
+AGENT_MAX_ITERATIONS=200
+AGENT_TIMEOUT_SECONDS=600
+AGENT_COMPACTION_TRIGGER_RATIO=0.85
+AGENT_MEMORY_FLUSH_ENABLED=true
+AGENT_TOOL_OUTPUT_MAX_TOKENS=8000
+
+# Sub-agents
+SUBAGENT_MAX_DEPTH=2
+SUBAGENT_DEFAULT_TIMEOUT_SECONDS=300
+
+# Server
+PORT=3001
+HOST=0.0.0.0
+```
+
+#### 16.11.2 Per-Task Overrides
+
+Tasks can override defaults via `execution_config` in the TaskCommand:
+
+```typescript
+interface ExecutionConfig {
+  timeout_seconds?: number;
+  max_iterations?: number;
+  model?: string;
+  compaction?: Partial<CompactionConfig>;
+}
+```
+
+### 16.12 Error Handling
+
+#### 16.12.1 Error Categories
+
+| Category | Examples | Handling |
+|----------|----------|----------|
+| Transient | Network timeout, rate limit, container startup | Retry with exponential backoff |
+| Permanent | Invalid command, corrupted state | Fail immediately |
+| Agent-level | Max iterations, doom loop, timeout | Fail with diagnostic |
+| Tool-level | Command failed, file not found | Agent sees error, adapts |
+
+#### 16.12.2 LLM Error Handling
+
+```typescript
+interface LLMRetryConfig {
+  max_retries: number;          // default: 3
+  backoff_base_ms: number;      // default: 1000
+  backoff_multiplier: number;   // default: 2
+  max_backoff_ms: number;       // default: 30000
+}
+```
+
+On LLM error:
+1. Retry with exponential backoff
+2. If rate limited, wait for retry-after header
+3. If model unavailable, fail the task (no silent model fallback — explicit config required)
+
+#### 16.12.3 Container Error Handling
+
+- Container startup failure: retry 2x, then fail task
+- Container OOM: fail task with diagnostic
+- Container network error: retry command, not container
+
+### 16.13 Observability
+
+#### 16.13.1 Metrics
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `agent.loop.iterations` | Counter | task_id, status |
+| `agent.loop.duration_ms` | Histogram | status |
+| `agent.tool.calls` | Counter | tool_name, risk_level |
+| `agent.tool.duration_ms` | Histogram | tool_name |
+| `agent.tool.errors` | Counter | tool_name, error_type |
+| `agent.compaction.count` | Counter | task_id |
+| `agent.compaction.tokens_before` | Histogram | |
+| `agent.compaction.tokens_after` | Histogram | |
+| `agent.subagent.spawned` | Counter | |
+| `agent.subagent.duration_ms` | Histogram | status |
+| `agent.llm.latency_ms` | Histogram | model |
+| `agent.llm.tokens` | Counter | direction (input/output) |
+| `agent.doom_loop.detected` | Counter | |
+
+#### 16.13.2 Logs
+
+| Event | Level | Fields |
+|-------|-------|--------|
+| Task started | INFO | task_id, goal, model |
+| Tool executed | DEBUG | task_id, tool_name, duration_ms |
+| Tool failed | WARN | task_id, tool_name, error |
+| Compaction triggered | INFO | task_id, tokens_before, tokens_after |
+| Memory flush | INFO | task_id, files_written |
+| Sub-agent spawned | INFO | task_id, label, sub_agent_id |
+| Sub-agent completed | INFO | task_id, label, status, duration_ms |
+| Injection received | INFO | task_id, injection_type |
+| Doom loop detected | WARN | task_id, pattern |
+| Risk denied | WARN | task_id, tool_name, risk_level |
+| Task completed | INFO | task_id, status, iterations, duration_ms |
+| Task failed | ERROR | task_id, error_type, message |
 
 ---
 
-## 17. System Prompt Additions (for v3)
+## 17. System Prompt
 
-Append to the system prompt template from v2:
+The full system prompt template for the agent.
 
 ```markdown
+# Agent Identity
+
+You are an autonomous task execution agent. You receive a goal and work independently
+to complete it, using your tools to interact with the environment.
+
+# Planning
+
+Before starting work, create a plan using the `update_plan` tool. Update it as you progress.
+When you discover new information, revise your plan. A good plan keeps you on track during
+long-running tasks.
+
+# Tools
+
+You have access to the following tools:
+[auto-generated from tool registry]
+
+# File System
+
+Your workspace is at /workspace/. Use it to:
+- Store intermediate results and notes
+- Write deliverables to /workspace/output/
+- Save important findings to .memo/ using `save_memo` (these survive context summarization)
+- Your plan is at /workspace/.plan.md (managed by update_plan tool)
+
+# Context Management
+
+Your conversation may be summarized if it grows too long. Before summarization:
+- Important information is saved to .memo/ (you will be prompted)
+- Your plan at .plan.md persists
+- Workspace files persist
+
+After summarization, recover details using `search_memo` or reading workspace files.
+
+# Sub-Agents
+
+Use `spawn_agent` when a subtask would benefit from a fresh context window.
+Sub-agents share your workspace filesystem but have their own conversation context.
+Good for: long research tasks, parallel independent work, deep focused analysis.
+
+# Deliverables
+
+When you complete a piece of work for the user, register it with `publish_deliverable`.
+This marks the file as a final output. The user will review it on the project board.
+
+# Safety
+
+[risk rules from configuration]
+
+# Completion
+
+When you have completed the task:
+1. Update your plan to show all steps done
+2. Register all deliverables via `publish_deliverable`
+3. Write a final summary message (your last response without tool calls)
+
+If you cannot complete the task, explain what went wrong and what you tried.
+If you need user input, use `post_comment(block=true)` — do not guess.
+
 # Collaboration
 
 You work with a human via a project board. Your plan steps appear as work items on the board.
@@ -2667,58 +3602,41 @@ who manages up:
 
 ---
 
-## Appendix A: Migration from v2 to v3
+## Appendix A: Component Map
 
-### What to Add
+All components needed to build the service from scratch.
 
-| Component | Purpose |
-|-----------|---------|
-| `src/chat/` | Quick mode handler, intent classification, goal clarity analysis |
-| `src/board/` | Board Sync Engine, plan-to-board projection |
-| `src/comments/` | Comment storage, injection, and supersession logic |
-| `src/discussion/` | Discussion scheduler, sync chat handler, requirement refinement |
-| `src/deliverable/` | Deliverable review management |
-| `src/watcher/` | Watcher service, SourcePlugin interface, condition evaluators, dedup |
-| `src/watcher/plugins/` | Built-in source plugins (email, webhook, api_poll, rss, cron) |
-| `src/sleep-time/` | All sleep-time compute jobs |
-| `src/trace/` | Trace store, query API, summarization |
-| `src/improvement/` | Improvement proposal management |
-| `src/policy/` | Policy Engine: AttentionPolicy, WIPPolicy, AutonomyPolicy, PlanningPolicy, priority classification |
-| `src/notification/` | Notification Service: routing, batching, digest windows, DND, priority filtering |
-| `src/review/` | Weekly Review: briefing generator, review session handler, policy suggestions |
-| `src/calibration/` | Behavior feedback collection, policy suggestion engine |
-| `src/api/` | REST API routes (chat, tasks, watchers, files, policies, weekly review, etc.) |
-| `src/ws/` | WebSocket server for real-time updates |
-| `src/frontend/` | Next.js web application |
-| Database migrations | PostgreSQL schema (including watchers, chat_messages, superseded_by, user_policies, weekly_reviews, notification_queue, behavior_feedback) |
-
-### What to Modify
-
-| Component | Change |
-|-----------|--------|
-| `update_plan` tool | Add board sync side effect |
-| `ask_user` tool | Remove, replace with `post_comment(block=true)` |
-| `post_comment` tool | Add `supersedes` parameter for question supersession |
-| Agent loop | Add tool side effects pipeline |
-| Injection types | Add `user_comment`, `discussion_scheduled`, `review_feedback`, `watcher_event`, `file_uploaded` |
-| TaskStatus enum | Remove `DISCUSSING`, add `PLANNING`, mark as visualization-only |
-| Task data model | Add `success_criteria: SuccessCriterion[]` for OKR-style outcome definitions |
-| `publish_deliverable` flow | Add self-assessment pipeline: evaluate against success criteria before publishing |
-| Notification routing | All agent events route through Policy Engine → Notification Service before reaching frontend |
-| System prompt | Add planning (risk-first, success criteria), autonomy (micro-requests, manage-up), self-assessment instructions |
-
-### What is Unchanged
-
-| Component | Notes |
-|-----------|-------|
-| Agent loop core | Same LLM-in-a-loop |
-| Compaction engine | Same |
-| Sub-agent management | Same |
-| Skills system | Same |
-| Risk control | Same |
-| Container management | Same |
-| Session Coordinator | Same (extended with board events) |
+| Component | Section | Description |
+|-----------|---------|-------------|
+| `src/agent/loop.ts` | 16.1 | Core agent loop (LLM-in-a-loop) |
+| `src/agent/runner.ts` | 16.1 | Agent Runner: container + loop lifecycle |
+| `src/agent/injection.ts` | 16.1.4 | Injection queue (Redis Streams consumer) |
+| `src/agent/planning.ts` | 16.2 | Plan management, risk-first ordering |
+| `src/agent/compaction.ts` | 16.3 | Context compaction engine |
+| `src/agent/risk.ts` | 16.8 | Risk classification, doom loop detection |
+| `src/agent/self-assessment.ts` | 11.9 | Self-assessment against success criteria |
+| `src/agent/sub-agent.ts` | 16.6 | Sub-agent manager |
+| `src/agent/side-effects.ts` | 14.2 | Tool side effects pipeline |
+| `src/agent/tools/*` | 13, 16.2, 16.4, 16.5, 16.6, 16.7 | All tool implementations |
+| `src/chat/` | 2 | Quick mode handler, intent classification, goal clarity analysis |
+| `src/board/sync.ts` | 3.4 | Board Sync Engine, plan-to-board projection |
+| `src/discussion/` | 5 | Discussion scheduler, sync chat handler |
+| `src/policy/` | 11 | AttentionPolicy, WIPPolicy, AutonomyPolicy, PlanningPolicy |
+| `src/notification/` | 11.7 | Priority classification, routing, batching, digest, DND |
+| `src/watcher/` | 10 | Watcher service, SourcePlugin interface, condition evaluators, dedup |
+| `src/watcher/plugins/` | 10.3 | Built-in source plugins (email, webhook, api_poll, rss, cron) |
+| `src/sleep-time/` | 7 | All sleep-time compute jobs (digest, memory, failures, skills) |
+| `src/trace/` | 8 | Trace store (JSONL), query API, summarization |
+| `src/improvement/` | 9 | Improvement proposal management, apply/rollback |
+| `src/review/` | 11.8 | Weekly Review: briefing generator, calibration |
+| `src/container/` | 16.9 | Docker container lifecycle management |
+| `src/context/` | 16.4 | Tiered memory (workspace files, memos, consolidated knowledge) |
+| `src/llm/` | 16.11, 16.12 | Multi-provider LLM client, retry, model registry |
+| `src/db/` | 15 | Drizzle schema (17 tables), migrations |
+| `src/api/` | 12.3 | REST API routes (44 endpoints) |
+| `src/ws/` | 12.2 | WebSocket server for real-time updates |
+| `src/frontend/` | 12.1 | Next.js web application (10 pages) |
 
 ---
 
-*End of Execution Service Factsheet (v3)*
+*End of Execution Service Factsheet*

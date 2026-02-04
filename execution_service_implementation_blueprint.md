@@ -610,16 +610,15 @@ The full system prompt template is in the factsheet (Section 17). Key sections t
 
 ## 12. Files to Copy to New Repo
 
-Copy these files from the openclaw repo into the new `execution-service/docs/` directory:
+Copy these files from the openclaw repo into the new `execution-service/` directory:
 
 | Source (openclaw repo) | Destination (new repo) | Purpose |
 |------------------------|----------------------|---------|
-| `execution_service_factsheet_v3.md` | `docs/factsheet-v3.md` | Product spec: data models, interfaces, behaviors, DB schema, API, system prompt |
-| `execution_service_factsheet_v2.md` | `docs/factsheet-v2.md` | Agent loop core, compaction, planning, sub-agents, skills, risk, containers, config, error handling (v3 Section 16 references these) |
+| `execution_service_factsheet_v3.md` | `docs/factsheet.md` | Complete product spec: all data models, interfaces, behaviors, DB schema, API, agent loop, compaction, tools, system prompt |
 | `execution_service_implementation_blueprint.md` | `docs/blueprint.md` | Implementation plan: repo structure, phases, tech stack, dependencies |
 | `execution_service_CLAUDE.md` | `CLAUDE.md` | Project conventions for Claude Code |
 
-**Important**: The v3 factsheet references "unchanged from v2" sections (Section 16) for the agent loop core, compaction engine, sub-agent management, skills, risk control, Docker management, configuration, and error handling. The new session needs v2 to implement those components.
+The factsheet is self-contained — it includes both the high-level product features (Sections 1-12) and the core agent architecture (Section 16: agent loop, compaction, planning, tools, sub-agents, skills, risk, Docker, config, error handling).
 
 ---
 
@@ -632,11 +631,11 @@ I'm building a new project from scratch: an autonomous agent execution service
 with a project board UI, policy engine, and external world watchers.
 
 Reference documents (in docs/):
-- factsheet-v3.md — the full product spec (data models, interfaces, behaviors, DB schema,
-  API, system prompt). This is the primary reference.
-- factsheet-v2.md — contains the agent loop core, compaction engine, sub-agents, skills,
-  risk control, Docker management, configuration, and error handling specs. v3 Section 16
-  says "unchanged from v2" for these — implement them from this document.
+- factsheet.md — the complete product spec. Sections 1-12 cover product features
+  (board, chat, collaboration, watchers, policy engine, sleep-time compute).
+  Section 16 covers core agent architecture (agent loop, compaction, planning tool,
+  tools, sub-agents, skills, risk, Docker containers, config, error handling).
+  Section 15 has the full DB schema. Section 17 has the system prompt.
 - blueprint.md — implementation plan (repo structure, phases, tech stack, dependencies)
 
 Start with Phase 1 from the blueprint. Build the foundation: repo scaffold, DB schema,
@@ -644,8 +643,9 @@ basic agent loop, tool implementations, trace storage.
 
 Follow the repo structure exactly as specified in the blueprint Section 3.
 Use the tech stack specified in Section 2.
-Implement the DB schema from factsheet-v3 Section 15.
-For agent loop, compaction, risk, sub-agents, skills, and containers, reference factsheet-v2.
+Implement the DB schema from factsheet Section 15.
+For agent loop, compaction, risk, sub-agents, skills, and containers, reference
+factsheet Section 16.
 ```
 
 ---
