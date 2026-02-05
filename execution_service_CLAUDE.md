@@ -9,6 +9,7 @@ Autonomous agent execution service with project board UI, policy engine, and ext
 ## Project Structure
 
 - Monorepo with pnpm workspaces
+- `packages/shared/` — Shared types and Zod schemas (imported by both server and web)
 - `packages/server/` — Fastify backend (API, WebSocket, agent runner, policy engine, watchers, sleep-time compute)
 - `packages/web/` — Next.js frontend (board, chat, trace viewer, settings)
 - `docs/` — Spec documents (factsheet, blueprint)
@@ -27,7 +28,7 @@ Autonomous agent execution service with project board UI, policy engine, and ext
 - DB migrations: `pnpm --filter server db:migrate`
 - DB push (dev): `pnpm --filter server db:push`
 - Type check: `pnpm typecheck`
-- Docker (local infra): `docker compose up -d` (Postgres + Redis)
+- Docker (local infra): `docker compose up -d` (Postgres; Redis optional Phase 2+)
 
 ## Coding Style
 
@@ -44,18 +45,20 @@ Autonomous agent execution service with project board UI, policy engine, and ext
 
 - All agent events route through the Policy Engine before reaching the user
 - WebSocket for all real-time updates (board, comments, traces, discussions, notifications)
-- Injection queue (Redis Streams) for user → agent communication
-- Tool side effects pipeline: tools execute, then side effects update board/DB/WebSocket
+- Injection queue (in-memory Phase 1, Redis Streams Phase 2+) for user -> agent communication
+- Tool side effects pipeline: tools execute, then side effects update board/DB, events broadcast via WebSocket
 - Plan-to-board projection: agent's plan is the source of truth; work items are derived
-- Traces stored as JSONL, indexed in Postgres
+- Traces stored in Postgres (traces table)
+- All agents run in a single shared Docker container; workspace isolation via /workspace/{task_id}/
+- DB uses native UUID primary keys throughout
 
 ## Key Data Flow
 
 ```
-User (chat/board) → REST API → creates task → Agent Runner spawns container
-Agent loop: LLM call → tool call → side effects → trace → next iteration
+User (chat/board) -> REST API -> creates task -> Agent Runner runs in shared container
+Agent loop: LLM call -> tool call -> side effects -> trace -> next iteration
 Side effects: update board, post comments, publish deliverables, route notifications
-User comments → injection queue → agent sees on next iteration
+User comments -> injection queue -> agent sees on next iteration
 Policy Engine: filters all notifications by priority/policy before delivery
 ```
 

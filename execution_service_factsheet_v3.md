@@ -69,7 +69,7 @@ Agents run autonomously in Docker containers using an LLM-in-a-loop architecture
 │                                                                                  │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐   │
 │  │ Agent Runner      │  │ Trace Store      │  │ Sleep-Time Compute            │   │
-│  │ (agent loop,      │  │ (JSONL per task, │  │ (nightly: digest, memory,     │   │
+│  │ (agent loop,      │  │ (Postgres,       │  │ (nightly: digest, memory,     │   │
 │  │  tools, container)│  │  query API)      │  │  failures, skills)            │   │
 │  └──────────────────┘  └──────────────────┘  └──────────────────────────────┘   │
 │                                                                                  │
@@ -111,6 +111,8 @@ Standard chatbot UX. User types in the chat panel, agent responds directly. No t
 - "What's the status of my tasks?" → checks board, responds
 
 Quick mode conversations are still persisted (for trace/memory purposes) but do not appear on the project board.
+
+If a Quick Mode conversation reveals a topic that warrants deeper agent work, the user can escalate specific chat messages into a task's agent context. The escalated messages are linked via `escalated_to_task_id` in the `chat_messages` table, and injected into the agent's context window as background context when the task starts.
 
 ### 2.3 Task Mode — Chat-Based Task Creation
 
@@ -222,9 +224,8 @@ The project board is the **primary UI for managing long-horizon tasks**. Once a 
 ```typescript
 /** A Task is the top-level unit — an Epic or Story depending on complexity */
 interface Task {
-  task_id: string;
-  session_id: string;
-  user_id: string;
+  task_id: string;              // UUID format
+  user_id: string;              // UUID, references users table
 
   /** User-provided goal */
   goal: string;
@@ -334,6 +335,11 @@ enum WorkItemStatus {
 When the agent calls `update_plan`, the Board Sync Engine runs:
 
 ```typescript
+import { EventEmitter } from 'node:events';
+
+const boardEvents = new EventEmitter();
+
+/** Pure data operation: sync plan steps to DB. Emits 'board:updated' when done. */
 async function syncPlanToBoard(taskId: string, plan: PlanSnapshot): Promise<void> {
   const existingItems = await db.getWorkItems(taskId);
   const existingIds = new Set(existingItems.map(i => i.item_id));
@@ -361,13 +367,23 @@ async function syncPlanToBoard(taskId: string, plan: PlanSnapshot): Promise<void
     }
   }
 
-  // Items no longer in plan → mark as SKIPPED
+  // Items no longer in plan -> mark as SKIPPED
   for (const removedId of existingIds) {
     await db.updateWorkItem(removedId, { status: 'SKIPPED' });
   }
 
-  // Push real-time update to frontend via WebSocket
-  await ws.broadcast(taskId, { type: 'board_updated', items: plan.steps });
+  // Emit event — WebSocket broadcaster picks this up separately
+  boardEvents.emit('board:updated', { taskId, items: plan.steps });
+}
+
+/**
+ * WebSocket broadcaster — listens for board events and pushes to connected clients.
+ * Decoupled from syncPlanToBoard so DB writes and broadcasting are independent concerns.
+ */
+function initBoardBroadcaster(ws: WebSocketServer): void {
+  boardEvents.on('board:updated', ({ taskId, items }) => {
+    ws.broadcast(taskId, { type: 'board_updated', items });
+  });
 }
 
 function mapPlanStatusToWorkItemStatus(planStatus: string): WorkItemStatus {
@@ -772,11 +788,11 @@ enum DiscussionStatus {
 }
 
 interface DiscussionSession {
-  session_id: string;
-  request_id: string;
-  task_id: string;
+  session_id: string;           // UUID format
+  request_id: string;           // UUID, references discussion_requests
+  task_id: string;              // UUID, references tasks
   item_id: string;
-  messages: DiscussionMessage[];
+  /** Messages are stored in the separate discussion_messages table, not inline */
   summary?: string;
   next_steps?: string[];
   confirmed_by_user: boolean;
@@ -1094,8 +1110,8 @@ type ProposedChange =
   | { type: 'tool_hint'; tool_name: string; hint: string };
 
 interface TraceEvidence {
-  task_id: string;
-  trace_file: string;
+  task_id: string;              // UUID format
+  trace_id: string;             // UUID, references traces table
   iteration: number;
   description: string;
 }
@@ -1176,7 +1192,7 @@ A good skill candidate:
 
 ### 8.1 Trace Storage
 
-Every agent loop iteration produces trace entries stored as JSONL:
+Every agent loop iteration produces trace entries stored directly in PostgreSQL (the `traces` table):
 
 ```typescript
 interface TraceEntry {
@@ -1215,7 +1231,11 @@ type TraceEventType =
 ### 8.2 Trace Query API
 
 ```typescript
+/** Trace storage backed by PostgreSQL. All entries are rows in the `traces` table. */
 interface TraceStore {
+  /** Append a trace entry (inserts a row into the traces table) */
+  append(entry: TraceEntry): Promise<void>;
+
   /** Get all traces for a task */
   getTraces(taskId: string): Promise<TraceEntry[]>;
 
@@ -1296,7 +1316,7 @@ The trace viewer lets users inspect agent behavior step by step (like LangSmith)
                                    │
                                    ▼
                     ┌──────────────────────────────┐
-                    │     TRACES STORED (JSONL)     │
+                    │    TRACES STORED (Postgres)   │
                     └──────────────┬───────────────┘
                                    │
                                    ▼
@@ -1502,12 +1522,76 @@ type WatcherAction =
   | { type: 'run_skill'; skill_name: string; args_template: string }
   | { type: 'multi'; actions: WatcherAction[] };           // Multiple actions
 
-type SourceConfig = Record<string, unknown>;  // Plugin-specific
-// Examples:
-// email_imap: { host, port, user, password, folder, from_filter, subject_filter }
-// api_poll:   { url, method, headers, extract_path, auth }
-// webhook:    { path_suffix, verify_secret }
-// rss:        { feed_url }
+// Per-plugin Zod validation schemas for SourceConfig
+import { z } from 'zod';
+
+const EmailImapConfigSchema = z.object({
+  host: z.string(),
+  port: z.number().int().positive(),
+  user: z.string(),
+  password: z.string(),
+  folder: z.string().default('INBOX'),
+  tls: z.boolean().default(true),
+  from_filter: z.string().optional(),
+  subject_filter: z.string().optional(),
+});
+
+const ApiPollConfigSchema = z.object({
+  url: z.string().url(),
+  method: z.enum(['GET', 'POST']).default('GET'),
+  headers: z.record(z.string()).optional(),
+  body: z.string().optional(),
+  extract_path: z.string().optional(),       // JSONPath expression
+  auth: z.object({
+    type: z.enum(['bearer', 'basic', 'api_key']),
+    token: z.string().optional(),
+    username: z.string().optional(),
+    password: z.string().optional(),
+    header_name: z.string().optional(),      // For api_key type
+  }).optional(),
+});
+
+const WebhookConfigSchema = z.object({
+  path_suffix: z.string(),                   // e.g., '/github' -> POST /api/webhooks/github
+  verify_secret: z.string().optional(),      // HMAC signature verification
+});
+
+const RssConfigSchema = z.object({
+  feed_url: z.string().url(),
+});
+
+const WebSocketSourceConfigSchema = z.object({
+  url: z.string().url(),
+  headers: z.record(z.string()).optional(),
+  ping_interval_ms: z.number().optional(),
+});
+
+const CronConfigSchema = z.object({
+  cron_expression: z.string(),               // e.g., '0 9 * * MON'
+  label: z.string().optional(),
+});
+
+/** Registry mapping plugin id to Zod schema */
+const SOURCE_CONFIG_SCHEMAS: Record<string, z.ZodSchema> = {
+  email_imap: EmailImapConfigSchema,
+  api_poll: ApiPollConfigSchema,
+  webhook: WebhookConfigSchema,
+  rss: RssConfigSchema,
+  websocket: WebSocketSourceConfigSchema,
+  cron: CronConfigSchema,
+};
+
+/** Validate config for a specific plugin. Throws ZodError on invalid config. */
+function validateSourceConfig(pluginId: string, config: unknown): Record<string, unknown> {
+  const schema = SOURCE_CONFIG_SCHEMAS[pluginId];
+  if (!schema) {
+    throw new Error(`Unknown source plugin: ${pluginId}`);
+  }
+  return schema.parse(config) as Record<string, unknown>;
+}
+
+// Runtime type — actual shape is validated per-plugin above.
+type SourceConfig = Record<string, unknown>;
 ```
 
 ### 10.5 Deduplication
@@ -1641,8 +1725,59 @@ interface UserPolicy {
   review: ReviewPolicy;         // Already exists (Section 4.4), now part of policy engine
   autonomy: AutonomyPolicy;
   planning: PlanningPolicy;
+  cost: CostPolicy;             // Token/cost budget controls
 }
 ```
+
+### 11.2a Policy Engine Facade
+
+Rather than having callers directly access individual policy modules, the policy engine exposes a single entry point. All agent events flow through this facade, which evaluates the relevant policies and returns a unified decision.
+
+```typescript
+interface AgentEvent {
+  type: string;                   // e.g., 'tool_call', 'deliverable_published', 'comment_posted'
+  task_id: string;
+  data: Record<string, unknown>;
+  timestamp: string;
+}
+
+type PolicyDecision =
+  | { action: 'allow' }
+  | { action: 'block'; reason: string; notify_user: boolean }
+  | { action: 'queue'; deliver_at: string }   // Batch for digest
+  | { action: 'warn'; message: string }       // Budget warning
+  | { action: 'deny'; reason: string };       // Budget exceeded
+
+/**
+ * Unified policy engine entry point. Evaluates all relevant policies
+ * (attention, WIP, autonomy, planning, cost) for the given event
+ * and returns a single decision.
+ *
+ * Callers should NOT access individual policy modules directly —
+ * route everything through this interface.
+ */
+interface PolicyEngine {
+  /** Evaluate an agent event against all active policies for a user */
+  evaluate(event: AgentEvent, userId: string): Promise<PolicyDecision>;
+
+  /** Load user policies (with defaults) */
+  loadPolicies(userId: string): Promise<UserPolicy>;
+
+  /** Update a user's policies */
+  updatePolicies(userId: string, updates: Partial<UserPolicy>): Promise<UserPolicy>;
+
+  /** Check if a task or user is within cost budgets */
+  checkBudget(userId: string, taskId: string): Promise<{
+    within_budget: boolean;
+    task_tokens_used: number;
+    day_tokens_used: number;
+    day_cost_usd: number;
+    warnings: string[];
+  }>;
+}
+```
+
+The individual policy modules (`attention.ts`, `wip.ts`, `autonomy.ts`, `planning.ts`, `cost.ts`) become internal implementation details of the policy engine, not public APIs.
 
 ### 11.3 AttentionPolicy
 
@@ -1842,6 +1977,51 @@ const DEFAULT_PLANNING_POLICY: PlanningPolicy = {
   require_success_criteria: true,
 };
 ```
+
+### 11.6a CostPolicy
+
+Controls token and cost budgets per user. The policy engine checks budgets on every LLM call and blocks execution when limits are exceeded.
+
+```typescript
+interface CostPolicy {
+  /**
+   * Maximum tokens (input + output) per single task execution.
+   * When exceeded, the agent pauses and asks the user for approval to continue.
+   * Default: 500_000.
+   */
+  max_tokens_per_task: number;
+
+  /**
+   * Maximum tokens across all tasks in a calendar day (UTC).
+   * When exceeded, new tasks are queued until the next day.
+   * Default: 2_000_000.
+   */
+  max_tokens_per_day: number;
+
+  /**
+   * Maximum estimated cost (USD) per calendar day.
+   * Calculated from token counts x model pricing.
+   * Default: 50.00.
+   */
+  max_cost_per_day_usd: number;
+
+  /**
+   * Warning threshold as a percentage (0-100).
+   * When usage hits this % of any budget, notify the user.
+   * Default: 80.
+   */
+  warning_threshold_percent: number;
+}
+
+const DEFAULT_COST_POLICY: CostPolicy = {
+  max_tokens_per_task: 500_000,
+  max_tokens_per_day: 2_000_000,
+  max_cost_per_day_usd: 50.00,
+  warning_threshold_percent: 80,
+};
+```
+
+Budget enforcement uses the `cost_usage` table (Section 15) to track accumulated usage. The policy engine's `checkBudget()` method queries this table before each LLM call and returns a `'warn'` or `'deny'` decision when thresholds are hit.
 
 ### 11.7 Notification Service
 
@@ -2287,7 +2467,7 @@ async function executeToolWithSideEffects(
     case 'update_plan':
       const plan = JSON.parse(toolCall.arguments);
       await syncPlanToBoard(taskId, plan);
-      await ws.broadcast(taskId, { type: 'board_updated', items: plan.steps });
+      // WebSocket broadcast handled by boardEvents listener (see Section 3.4)
       break;
 
     case 'post_comment':
@@ -2321,15 +2501,27 @@ async function executeToolWithSideEffects(
 ### 15.1 Tables
 
 ```sql
+-- Users (auth + identity)
+CREATE TABLE users (
+  user_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email          TEXT UNIQUE NOT NULL,
+  name           TEXT NOT NULL,
+  avatar_url     TEXT,
+  auth_provider  TEXT NOT NULL,                  -- e.g., 'google', 'github', 'email'
+  auth_provider_id TEXT NOT NULL,                -- provider-specific user ID
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_active_at TIMESTAMPTZ,
+  UNIQUE (auth_provider, auth_provider_id)
+);
+
 -- Tasks
 CREATE TABLE tasks (
-  task_id        TEXT PRIMARY KEY,
-  session_id     TEXT NOT NULL,
-  user_id        TEXT NOT NULL,
+  task_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID NOT NULL REFERENCES users(user_id),
   goal           TEXT NOT NULL,
   constraints    JSONB,
   size           TEXT CHECK (size IN ('story', 'epic')),
-  status         TEXT NOT NULL DEFAULT 'PLANNING',  -- Visualization-only: PLANNING → RUNNING → COMPLETED
+  status         TEXT NOT NULL DEFAULT 'PLANNING',  -- PLANNING -> RUNNING -> COMPLETED
   plan_snapshot  JSONB,
   success_criteria JSONB,                         -- SuccessCriterion[] (OKR-style, Section 11)
   usage          JSONB,
@@ -2340,8 +2532,8 @@ CREATE TABLE tasks (
 
 -- Work Items (projections of plan steps)
 CREATE TABLE work_items (
-  item_id        TEXT NOT NULL,
-  task_id        TEXT NOT NULL REFERENCES tasks(task_id),
+  item_id        UUID NOT NULL,
+  task_id        UUID NOT NULL REFERENCES tasks(task_id),
   description    TEXT NOT NULL,
   status         TEXT NOT NULL DEFAULT 'TODO',
   notes          TEXT,
@@ -2354,22 +2546,22 @@ CREATE TABLE work_items (
 
 -- Comments
 CREATE TABLE comments (
-  comment_id     TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  item_id        TEXT,         -- NULL for task-level comments
-  task_id        TEXT NOT NULL REFERENCES tasks(task_id),
+  comment_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  item_id        UUID,                           -- NULL for task-level comments
+  task_id        UUID NOT NULL REFERENCES tasks(task_id),
   author_type    TEXT NOT NULL CHECK (author_type IN ('agent', 'user', 'system')),
-  author_id      TEXT NOT NULL,
+  author_id      UUID NOT NULL,                  -- references users.user_id for 'user' type
   content        TEXT NOT NULL,
   comment_type   TEXT NOT NULL,
-  superseded_by  TEXT REFERENCES comments(comment_id),  -- Question supersession
+  superseded_by  UUID REFERENCES comments(comment_id),  -- Question supersession
   created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Deliverables
 CREATE TABLE deliverables (
-  deliverable_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  task_id        TEXT NOT NULL REFERENCES tasks(task_id),
-  item_id        TEXT,
+  deliverable_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id        UUID NOT NULL REFERENCES tasks(task_id),
+  item_id        UUID,
   filepath       TEXT NOT NULL,
   description    TEXT NOT NULL,
   type           TEXT NOT NULL,
@@ -2383,9 +2575,9 @@ CREATE TABLE deliverables (
 
 -- Discussion Requests
 CREATE TABLE discussion_requests (
-  request_id     TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  task_id        TEXT NOT NULL REFERENCES tasks(task_id),
-  item_id        TEXT NOT NULL,
+  request_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id        UUID NOT NULL REFERENCES tasks(task_id),
+  item_id        UUID NOT NULL,
   topic          TEXT NOT NULL,
   context        TEXT NOT NULL,
   preparation_notes TEXT,
@@ -2398,23 +2590,32 @@ CREATE TABLE discussion_requests (
   ended_at       TIMESTAMPTZ
 );
 
--- Discussion Sessions
+-- Discussion Sessions (messages stored in discussion_messages table, not inline)
 CREATE TABLE discussion_sessions (
-  session_id     TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  request_id     TEXT NOT NULL REFERENCES discussion_requests(request_id),
-  task_id        TEXT NOT NULL,
-  item_id        TEXT NOT NULL,
-  messages       JSONB NOT NULL DEFAULT '[]',
+  session_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  request_id     UUID NOT NULL REFERENCES discussion_requests(request_id),
+  task_id        UUID NOT NULL,
+  item_id        UUID NOT NULL,
   summary        TEXT,
   next_steps     JSONB,
   confirmed_by_user BOOLEAN DEFAULT FALSE,
   created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Discussion Messages (normalized from JSONB array in discussion_sessions)
+CREATE TABLE discussion_messages (
+  message_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id     UUID NOT NULL REFERENCES discussion_sessions(session_id),
+  role           TEXT NOT NULL CHECK (role IN ('user', 'agent')),
+  content        TEXT NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_discussion_messages_session ON discussion_messages(session_id, created_at);
+
 -- Improvement Proposals
 CREATE TABLE improvement_proposals (
-  proposal_id    TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  user_id        TEXT NOT NULL,
+  proposal_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID NOT NULL REFERENCES users(user_id),
   detection_type TEXT NOT NULL,
   description    TEXT NOT NULL,
   evidence       JSONB NOT NULL DEFAULT '[]',
@@ -2428,43 +2629,49 @@ CREATE TABLE improvement_proposals (
 
 -- Applied Changes (for rollback)
 CREATE TABLE applied_changes (
-  change_id      TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  proposal_id    TEXT NOT NULL REFERENCES improvement_proposals(proposal_id),
+  change_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  proposal_id    UUID NOT NULL REFERENCES improvement_proposals(proposal_id),
   change_type    TEXT NOT NULL,
   applied_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  applied_by     TEXT NOT NULL,
+  applied_by     UUID NOT NULL REFERENCES users(user_id),
   previous_value TEXT,
   rollback_available BOOLEAN DEFAULT TRUE
 );
 
 -- Daily Digests
 CREATE TABLE daily_digests (
-  digest_id      TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  user_id        TEXT NOT NULL,
+  digest_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID NOT NULL REFERENCES users(user_id),
   date           DATE NOT NULL,
   content        JSONB NOT NULL,
   generated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(user_id, date)
 );
 
--- Trace index (traces stored as JSONL files, this is the index)
-CREATE TABLE trace_index (
-  task_id        TEXT NOT NULL REFERENCES tasks(task_id),
-  trace_file     TEXT NOT NULL,
-  total_entries  INT NOT NULL DEFAULT 0,
-  total_tokens   BIGINT NOT NULL DEFAULT 0,
-  started_at     TIMESTAMPTZ NOT NULL,
-  ended_at       TIMESTAMPTZ,
-  PRIMARY KEY (task_id)
+-- Traces (full trace entries stored in Postgres — no JSONL files)
+CREATE TABLE traces (
+  trace_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id        UUID NOT NULL REFERENCES tasks(task_id),
+  iteration      INT NOT NULL,
+  event_type     TEXT NOT NULL,
+  timestamp      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  duration_ms    INT,
+  tokens_input   INT,
+  tokens_output  INT,
+  data           JSONB NOT NULL DEFAULT '{}',
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX idx_traces_task_id ON traces(task_id, iteration);
+CREATE INDEX idx_traces_event_type ON traces(task_id, event_type);
+CREATE INDEX idx_traces_timestamp ON traces(timestamp);
 
 -- Watchers (external world monitoring)
 CREATE TABLE watchers (
-  watcher_id     TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  user_id        TEXT NOT NULL,
+  watcher_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID NOT NULL REFERENCES users(user_id),
   name           TEXT NOT NULL,
   source_plugin  TEXT NOT NULL,
-  source_config  JSONB NOT NULL,
+  source_config  JSONB NOT NULL,                 -- Validated by per-plugin Zod schema (Section 10.4)
   condition      JSONB NOT NULL,
   action         JSONB NOT NULL,
   poll_interval_seconds INT,
@@ -2477,42 +2684,43 @@ CREATE TABLE watchers (
 
 -- Watcher trigger history
 CREATE TABLE watcher_history (
-  history_id     TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  watcher_id     TEXT NOT NULL REFERENCES watchers(watcher_id),
+  history_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  watcher_id     UUID NOT NULL REFERENCES watchers(watcher_id),
   event_id       TEXT NOT NULL,
   event_data     JSONB NOT NULL,
   condition_result BOOLEAN NOT NULL,
   action_taken   TEXT,
-  created_task_id TEXT REFERENCES tasks(task_id),
+  created_task_id UUID REFERENCES tasks(task_id),
   triggered_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Chat conversations (Quick Mode history)
 CREATE TABLE chat_messages (
-  message_id     TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  user_id        TEXT NOT NULL,
+  message_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID NOT NULL REFERENCES users(user_id),
   role           TEXT NOT NULL CHECK (role IN ('user', 'agent')),
   content        TEXT NOT NULL,
-  /** If this chat led to task creation, link it */
-  spawned_task_id TEXT REFERENCES tasks(task_id),
+  spawned_task_id UUID REFERENCES tasks(task_id),      -- If this chat led to task creation
+  escalated_to_task_id UUID REFERENCES tasks(task_id), -- If escalated into a running task's context
   created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- User Policies (Policy Engine configuration per user)
 CREATE TABLE user_policies (
-  user_id        TEXT PRIMARY KEY,
+  user_id        UUID PRIMARY KEY REFERENCES users(user_id),
   attention      JSONB NOT NULL DEFAULT '{}',   -- AttentionPolicy
   wip            JSONB NOT NULL DEFAULT '{}',   -- WIPPolicy
   review         JSONB NOT NULL DEFAULT '{}',   -- ReviewPolicy (Section 4.4)
   autonomy       JSONB NOT NULL DEFAULT '{}',   -- AutonomyPolicy
   planning       JSONB NOT NULL DEFAULT '{}',   -- PlanningPolicy
+  cost           JSONB NOT NULL DEFAULT '{}',   -- CostPolicy (token/cost budgets)
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Weekly Reviews
 CREATE TABLE weekly_reviews (
-  review_id      TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  user_id        TEXT NOT NULL,
+  review_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID NOT NULL REFERENCES users(user_id),
   week           TEXT NOT NULL,                 -- ISO week: "2026-W05"
   scheduled_at   TIMESTAMPTZ NOT NULL,
   status         TEXT NOT NULL DEFAULT 'pending'
@@ -2525,8 +2733,8 @@ CREATE TABLE weekly_reviews (
 
 -- Notification Queue (for digest batching / DND accumulation)
 CREATE TABLE notification_queue (
-  notification_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  user_id        TEXT NOT NULL,
+  notification_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID NOT NULL REFERENCES users(user_id),
   event_type     TEXT NOT NULL,
   event_data     JSONB NOT NULL,
   priority       TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high', 'blocker')),
@@ -2538,13 +2746,27 @@ CREATE INDEX idx_notification_queue_user_pending
 
 -- Behavior Feedback (calibration data from human)
 CREATE TABLE behavior_feedback (
-  feedback_id    TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
-  user_id        TEXT NOT NULL,
+  feedback_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID NOT NULL REFERENCES users(user_id),
   feedback_type  TEXT NOT NULL,
   description    TEXT,
   suggested_change JSONB,                       -- PolicySuggestion
   created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Cost tracking (aggregated usage for budget enforcement)
+CREATE TABLE cost_usage (
+  usage_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID NOT NULL REFERENCES users(user_id),
+  task_id        UUID REFERENCES tasks(task_id),  -- NULL for aggregate daily entries
+  date           DATE NOT NULL,
+  tokens_input   BIGINT NOT NULL DEFAULT 0,
+  tokens_output  BIGINT NOT NULL DEFAULT 0,
+  estimated_cost_usd NUMERIC(10, 4) NOT NULL DEFAULT 0,
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_cost_usage_user_date ON cost_usage(user_id, date);
+CREATE INDEX idx_cost_usage_task ON cost_usage(task_id) WHERE task_id IS NOT NULL;
 ```
 
 ---
@@ -2699,7 +2921,12 @@ interface InjectionQueue {
 }
 ```
 
-Implementation: Redis list per task_id. API server pushes, agent loop drains.
+**Implementation (phased):**
+- **Phase 1**: In-memory queue (or Postgres-backed polling table). Sufficient for single-server
+  deployment with low concurrency. The queue is a simple `Map<taskId, AgentInjection[]>` in memory,
+  or a `pending_injections` table polled each iteration.
+- **Phase 2+**: Redis Streams per task_id for horizontal scaling, multi-server deployment,
+  and durable queuing. Migrate when the system needs concurrent multi-server agent execution.
 
 ### 16.2 Planning Tool (Context Engineering)
 
@@ -3212,43 +3439,68 @@ When a doom loop is detected:
 
 ### 16.9 Docker Container Management
 
-#### 16.9.1 Container Lifecycle
+#### 16.9.1 Shared Container Model
+
+All agents and tasks run inside a **single shared Docker container** provisioned at service startup. Workspace isolation is achieved via per-task directories (`/workspace/{task_id}/`).
 
 ```
-Provision -> Start -> Execute (agent loop) -> Cleanup
+Service Start -> Provision shared container -> Ready
+  Task created -> Create /workspace/{task_id}/ -> Agent executes in workspace
+  Task complete -> Archive/cleanup workspace dir
+Service Stop -> Remove shared container
 ```
+
+This avoids the cost and latency of provisioning a new container per task while still providing a consistent execution environment with all required tooling pre-installed.
 
 #### 16.9.2 Container Configuration
 
 | Setting | Default |
 |---------|---------|
-| Image | execution-agent:latest |
-| Memory | 2GB |
-| CPU | 2 cores |
+| Image | execution-service-agent:latest |
+| Memory | 4GB (shared across all tasks) |
+| CPU | 4 cores (shared) |
 | Network | bridge (restricted) |
 | Workspace | /workspace/ (RW, mounted volume) |
 | Skills | /skills/ (RO, mounted) |
+| Env | All API keys, DB URL forwarded from host |
 
-#### 16.9.3 Container Per Task
+#### 16.9.3 Workspace Isolation
 
-Each task gets its own container. Sub-agents share the parent's container (and workspace).
+Each task gets its own workspace directory within the shared container. Sub-agents share the parent task's workspace.
+
+```
+/workspace/
+  {task_id_1}/
+    .plan.md
+    .memo/
+    .scratch/
+    output/
+    (task-specific files)
+  {task_id_2}/
+    ...
+```
+
+#### 16.9.4 ContainerManager Interface
 
 ```typescript
 interface ContainerManager {
-  /** Provision a new container for a task */
-  provision(config: ContainerConfig): Promise<DockerContainer>;
+  /** Ensure the shared container is running. Called once at service startup. */
+  ensureRunning(): Promise<void>;
 
-  /** Execute a command in the container */
-  exec(container: DockerContainer, command: string, timeout_ms: number): Promise<ExecResult>;
+  /** Create a workspace directory for a new task */
+  createTaskWorkspace(taskId: string): Promise<string>;
 
-  /** Read a file from the container */
-  readFile(container: DockerContainer, path: string): Promise<string>;
+  /** Execute a command in the shared container within a task's workspace */
+  exec(taskId: string, command: string, timeout_ms: number): Promise<ExecResult>;
 
-  /** Write a file to the container */
-  writeFile(container: DockerContainer, path: string, content: string): Promise<void>;
+  /** Read a file from a task's workspace */
+  readFile(taskId: string, path: string): Promise<string>;
 
-  /** Cleanup and remove container */
-  cleanup(container: DockerContainer): Promise<void>;
+  /** Write a file to a task's workspace */
+  writeFile(taskId: string, path: string, content: string): Promise<void>;
+
+  /** Cleanup workspace directory after task completes */
+  cleanupTaskWorkspace(taskId: string): Promise<void>;
 }
 ```
 
@@ -3258,9 +3510,8 @@ interface ContainerManager {
 
 ```typescript
 interface TaskCommand {
-  command_id: string;
-  session_id: string;
-  task_id: string;
+  command_id: string;             // UUID format
+  task_id: string;                // UUID format
   goal: string;
   constraints?: string[];
   execution_config: {
@@ -3282,9 +3533,8 @@ interface ResumeContext {
 
 ```typescript
 interface TaskResult {
-  task_id: string;
-  session_id: string;
-  command_id: string;
+  task_id: string;                // UUID format
+  command_id: string;             // UUID format
   status: TaskResultStatus;
   deliverables: Deliverable[];
   final_message?: string;
@@ -3626,13 +3876,13 @@ All components needed to build the service from scratch.
 | `src/watcher/` | 10 | Watcher service, SourcePlugin interface, condition evaluators, dedup |
 | `src/watcher/plugins/` | 10.3 | Built-in source plugins (email, webhook, api_poll, rss, cron) |
 | `src/sleep-time/` | 7 | All sleep-time compute jobs (digest, memory, failures, skills) |
-| `src/trace/` | 8 | Trace store (JSONL), query API, summarization |
+| `src/trace/` | 8 | Trace store (Postgres), query API, summarization |
 | `src/improvement/` | 9 | Improvement proposal management, apply/rollback |
 | `src/review/` | 11.8 | Weekly Review: briefing generator, calibration |
 | `src/container/` | 16.9 | Docker container lifecycle management |
 | `src/context/` | 16.4 | Tiered memory (workspace files, memos, consolidated knowledge) |
 | `src/llm/` | 16.11, 16.12 | Multi-provider LLM client, retry, model registry |
-| `src/db/` | 15 | Drizzle schema (17 tables), migrations |
+| `src/db/` | 15 | Drizzle schema (20 tables — includes users, traces, discussion_messages, cost_usage), migrations |
 | `src/api/` | 12.3 | REST API routes (44 endpoints) |
 | `src/ws/` | 12.2 | WebSocket server for real-time updates |
 | `src/frontend/` | 12.1 | Next.js web application (10 pages) |
